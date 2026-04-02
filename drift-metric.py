@@ -11,6 +11,7 @@ Patterns:
   A: Docstring trust — claim cites a comment/docstring, not runtime evidence
   B: Narrative fabrication — round numbers, simplified counts
   C: Assumption propagation — repeats prior context without fresh check
+  D: Post-compaction stale — claims about prior work after context clear/compact
 """
 
 import json
@@ -131,8 +132,64 @@ def _tier2_pattern(line_s: str) -> str | None:
     return None
 
 
+def _has_post_compaction_signal(line_s: str) -> bool:
+    """Detect claims that reference prior work without fresh verification.
+
+    After context compaction or /clear, Claude loses conversation history
+    but the drift DB persists. Claims about "what we did" or "what we found"
+    are especially dangerous here because Claude is reconstructing from
+    fragments, not from actual memory of the work.
+
+    Also catches user-side drift: when the user assumes something and Claude
+    echoes it without checking.
+    """
+    return bool(re.search(
+        r'\b(we found|we saw|we established|we determined|we confirmed|'
+        r'we verified|we checked|as we discussed|from our earlier|'
+        r'in the previous|last time|before the|when we ran|'
+        r'the results showed|the output was|I recall|if I remember|'
+        r'you mentioned|you said|you noted|you found|'
+        r'that should be|that would be|that was already|'
+        r'it was working|it should work|it already|we already)\b',
+        line_s, re.I
+    ))
+
+
+def _tier3_has_claim(line_s: str) -> bool:
+    """Tier 3 claim detection: catch-all for substantive statements.
+
+    Every non-trivial sentence is a potential claim. Research teams use
+    domain-specific language (QML, equivariant, D4, etc.) that tiers 1-2
+    miss. Tier 3 catches any sentence that makes a statement, unless it's
+    clearly a question or filler.
+    """
+    # Skip very short lines (greetings, "yes", "ok", etc.)
+    if len(line_s) < 15:
+        return False
+    # Skip questions
+    if line_s.rstrip().endswith("?"):
+        return False
+    # Skip pure list markers without content
+    if re.match(r'^[-*]\s*$', line_s):
+        return False
+    # Any remaining sentence with a verb-like structure is a claim
+    # (subject + verb patterns, or imperative statements)
+    if re.search(r'\b(is|are|was|were|has|have|had|does|do|did|will|would|can|could|should|must|means|uses|runs|takes|produces|generates|creates|returns|shows|contains|includes|supports|requires|needs|works|handles|processes|stores|loads|reads|writes|calls|sends|receives|accepts|provides|allows|enables|prevents|ensures|maintains|preserves|tracks|measures|detects|computes|calculates|implements|defines|represents|maps|converts|transforms|encodes|decodes)\b', line_s, re.I):
+        return True
+    # Declarative statements starting with common patterns
+    if re.match(r'(The|This|That|It|They|We|Our|Your|Each|Every|All|No|Any|Most|Some)\b', line_s):
+        return True
+    return False
+
+
 def analyze_response(response_text: str) -> list[dict]:
-    """Extract claims from response text. Returns list of claim dicts."""
+    """Extract claims from response text. Returns list of claim dicts.
+
+    Three tiers of detection (all responses tracked, no cold start):
+      Tier 1: Numbers, percentages, file references, speedup claims
+      Tier 2: Comparatives, temporals, assertive framing, backtick refs
+      Tier 3: Any substantive statement (catch-all for domain-specific language)
+    """
     claims = []
     lines = response_text.split("\n")
     for idx, line in enumerate(lines):
@@ -146,6 +203,9 @@ def analyze_response(response_text: str) -> list[dict]:
         if _tier1_has_claim(line_s):
             has_evidence = _tier1_has_evidence(line_s)
             pattern = None if has_evidence else _tier1_pattern(line_s)
+            # Pattern D overrides: post-compaction stale references
+            if not has_evidence and _has_post_compaction_signal(line_s):
+                pattern = "D"
             claims.append({
                 "text": line_s[:200],
                 "has_evidence": has_evidence,
@@ -158,11 +218,33 @@ def analyze_response(response_text: str) -> list[dict]:
         if _tier2_has_claim(line_s):
             has_evidence = _tier2_has_evidence(line_s, prev_line)
             pattern = None if has_evidence else _tier2_pattern(line_s)
+            if not has_evidence and _has_post_compaction_signal(line_s):
+                pattern = "D"
             claims.append({
                 "text": line_s[:200],
                 "has_evidence": has_evidence,
                 "pattern": pattern,
                 "tier": 2,
+            })
+            continue
+
+        # ── Tier 3: catch-all for substantive statements ──
+        # Every non-trivial statement is tracked. Domain-specific language
+        # (QML, equivariant maps, D4 orbits, etc.) won't slip through.
+        if _tier3_has_claim(line_s):
+            has_evidence = (
+                _tier1_has_evidence(line_s)
+                or _tier2_has_evidence(line_s, prev_line)
+            )
+            pattern = None if has_evidence else _tier2_pattern(line_s)
+            # Pattern D override: post-compaction stale claims
+            if not has_evidence and _has_post_compaction_signal(line_s):
+                pattern = "D"
+            claims.append({
+                "text": line_s[:200],
+                "has_evidence": has_evidence,
+                "pattern": pattern,
+                "tier": 3,
             })
 
     return claims
@@ -211,7 +293,7 @@ def _compute_alignment(conn, stats) -> str:
         return ""
 
 
-def _dynamic_funnel(conn, stats, drift, pa, pb, pc, unchecked) -> list[str]:
+def _dynamic_funnel(conn, stats, drift, pa, pb, pc, pd, unchecked) -> list[str]:
     """Context-dependent accountability intervention.
 
     Analyzes:
@@ -251,10 +333,11 @@ def _dynamic_funnel(conn, stats, drift, pa, pb, pc, unchecked) -> list[str]:
                 break
 
         # ── 3. Pattern severity weighting ──
-        # A (docstring trust) is most dangerous — leads to factual errors
-        # B (fabrication) is second — leads to misleading docs
-        # C (propagation) is third — leads to stale claims
-        weighted_severity = (pa * 3 + pb * 2 + pc * 1) / max(total, 1)
+        # D (post-compaction stale) is most dangerous — no context to check against
+        # A (docstring trust) is second — leads to factual errors
+        # B (fabrication) is third — leads to misleading docs
+        # C (propagation) is fourth — leads to stale claims
+        weighted_severity = (pd * 4 + pa * 3 + pb * 2 + pc * 1) / max(total, 1)
 
         # ── 4. Recency: fraction of unverified claims from last 3 turns ──
         recent_unverified = conn.execute(
@@ -288,12 +371,12 @@ def _dynamic_funnel(conn, stats, drift, pa, pb, pc, unchecked) -> list[str]:
             if streak >= 3:
                 lines.append("  {} consecutive high-drift turns. PAUSE and re-read the user's last instruction.".format(streak))
             # Target the dominant pattern
-            _add_pattern_intervention(lines, pa, pb, pc, unchecked)
+            _add_pattern_intervention(lines, pa, pb, pc, pd, unchecked)
 
         elif severity > 0.45:
             # WARNING: targeted intervention
             lines.append("! DRIFT WARNING (severity {:.0%})".format(severity))
-            _add_pattern_intervention(lines, pa, pb, pc, unchecked)
+            _add_pattern_intervention(lines, pa, pb, pc, pd, unchecked)
             if velocity > 0.05:
                 lines.append("  Trending worse. Slow down and verify.")
             elif velocity < -0.1:
@@ -334,17 +417,22 @@ def _dynamic_funnel(conn, stats, drift, pa, pb, pc, unchecked) -> list[str]:
     return lines
 
 
-def _add_pattern_intervention(lines, pa, pb, pc, unchecked):
+def _add_pattern_intervention(lines, pa, pb, pc, pd, unchecked):
     """Add targeted intervention based on which pattern is dominant."""
-    patterns = [("A", pa), ("B", pb), ("C", pc)]
+    patterns = [("A", pa), ("B", pb), ("C", pc), ("D", pd)]
     patterns.sort(key=lambda x: x[1], reverse=True)
 
     for pat, count in patterns:
         if count == 0:
             continue
-        if pat == "A":
+        if pat == "D":
+            lines.append("  Pattern D ({} claims): POST-COMPACTION STALE. You are citing prior work without fresh evidence. RE-READ files and RE-RUN commands. Context was lost.".format(count))
+            for item in unchecked:
+                if item.get("pattern") == "D":
+                    lines.append("    e.g. \"{}\"".format(item["claim_display"][:60]))
+                    break
+        elif pat == "A":
             lines.append("  Pattern A ({} claims): You cited a docstring or comment as truth. READ THE FILE, run the code, check the process.".format(count))
-            # Find an unchecked A claim to make it concrete
             for item in unchecked:
                 if item.get("pattern") == "A":
                     lines.append("    e.g. \"{}\"".format(item["claim_display"][:60]))
@@ -399,15 +487,17 @@ def main():
             stats = drift_db.get_session_drift(conn)
             turn = stats["last_turn"] + 1
 
-            # Analyze and store
+            # Analyze and store — EVERY turn is recorded, no cold start.
+            # Even turns with zero detected claims get a turn entry so the
+            # turn counter stays accurate and the session is always tracked.
             if response_text:
                 claims = analyze_response(response_text)
                 if claims:
                     drift_db.insert_claims(conn, turn, claims)
-                    total = len(claims)
-                    evidenced = sum(1 for c in claims if c["has_evidence"])
-                    drift = (total - evidenced) / total if total > 0 else 0.0
-                    drift_db.insert_turn(conn, turn, total, evidenced, drift)
+                total = len(claims)
+                evidenced = sum(1 for c in claims if c["has_evidence"])
+                drift = (total - evidenced) / total if total > 0 else 0.0
+                drift_db.insert_turn(conn, turn, total, evidenced, drift)
 
             # Get session-level stats
             stats = drift_db.get_session_drift(conn)
@@ -419,12 +509,13 @@ def main():
             # Format output
             total = stats["total"]
             drift = stats["drift"]
-            pa, pb, pc = stats["pattern_a"], stats["pattern_b"], stats["pattern_c"]
+            pa, pb, pc, pd = stats["pattern_a"], stats["pattern_b"], stats["pattern_c"], stats.get("pattern_d", 0)
 
             pattern_parts = []
             if pa: pattern_parts.append(f"A:{pa}")
             if pb: pattern_parts.append(f"B:{pb}")
             if pc: pattern_parts.append(f"C:{pc}")
+            if pd: pattern_parts.append(f"D:{pd}")
             pattern_str = f" | {' '.join(pattern_parts)}" if pattern_parts else ""
 
             lines = [
@@ -440,7 +531,7 @@ def main():
             # Context-dependent intervention based on drift severity, velocity,
             # pattern composition, and recency. Hardcoded thresholds are fallback.
 
-            funnel_msg = _dynamic_funnel(conn, stats, drift, pa, pb, pc, unchecked)
+            funnel_msg = _dynamic_funnel(conn, stats, drift, pa, pb, pc, pd, unchecked)
             if funnel_msg:
                 lines.append("")
                 lines.extend(funnel_msg)

@@ -324,6 +324,7 @@ def get_session_drift(conn) -> dict:
             "SUM(CASE WHEN pattern='A' THEN 1 ELSE 0 END) as pa, "
             "SUM(CASE WHEN pattern='B' THEN 1 ELSE 0 END) as pb, "
             "SUM(CASE WHEN pattern='C' THEN 1 ELSE 0 END) as pc, "
+            "SUM(CASE WHEN pattern='D' THEN 1 ELSE 0 END) as pd, "
             "MAX(turn) as last_turn "
             "FROM claims"
         ).fetchone()
@@ -337,12 +338,13 @@ def get_session_drift(conn) -> dict:
             "pattern_a": row["pa"] or 0,
             "pattern_b": row["pb"] or 0,
             "pattern_c": row["pc"] or 0,
+            "pattern_d": row["pd"] or 0,
             "last_turn": row["last_turn"] or 0,
         }
     except Exception as exc:
         _log.error("drift_db: get_session_drift failed: %s", exc)
         return {"total": 0, "evidenced": 0, "unverified": 0, "drift": 0.0,
-                "pattern_a": 0, "pattern_b": 0, "pattern_c": 0, "last_turn": 0}
+                "pattern_a": 0, "pattern_b": 0, "pattern_c": 0, "pattern_d": 0, "last_turn": 0}
 
 
 def get_unverified_commits(conn) -> list[dict]:

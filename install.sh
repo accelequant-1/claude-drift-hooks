@@ -4,11 +4,13 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TARGET=".claude/hooks"
-COMMANDS=".claude/commands"
-SETTINGS=".claude/settings.local.json"
+PROJECT_ROOT="$(pwd)"
+TARGET="$PROJECT_ROOT/.claude/hooks"
+COMMANDS="$PROJECT_ROOT/.claude/commands"
+SETTINGS="$PROJECT_ROOT/.claude/settings.local.json"
 
-echo "Installing drift hooks into $(pwd)/.claude/"
+echo "Installing drift hooks into $PROJECT_ROOT/.claude/"
+echo "  Using absolute paths for hook commands"
 
 # Create directories
 mkdir -p "$TARGET"
@@ -27,62 +29,152 @@ cp "$SCRIPT_DIR/commands/drift.md" "$COMMANDS/drift.md"
 chmod +x "$TARGET/drift-metric.sh" "$TARGET/git-commit-gate.sh" "$TARGET/git-push-gate.sh"
 
 # Add to .gitignore
-GITIGNORE=".claude/.gitignore"
+GITIGNORE="$PROJECT_ROOT/.claude/.gitignore"
 if [ ! -f "$GITIGNORE" ] || ! grep -q "hooks/\*.db" "$GITIGNORE" 2>/dev/null; then
     echo "" >> "$GITIGNORE"
     echo "# Drift metric (local-only, never commit)" >> "$GITIGNORE"
     echo "hooks/*.db" >> "$GITIGNORE"
     echo "hooks/drift_state.json" >> "$GITIGNORE"
     echo "hooks/drift_errors.log" >> "$GITIGNORE"
+    echo "hooks/__pycache__/" >> "$GITIGNORE"
+    echo "settings.local.json" >> "$GITIGNORE"
 fi
 
-# Merge hooks into settings.local.json
+# Generate settings with absolute paths
+# Claude Code hooks can run from ANY directory, so paths must be absolute
+HOOK_DIR="$TARGET"
+
 if [ -f "$SETTINGS" ]; then
-    # Settings exist — merge hooks section
+    # Settings exist — merge hooks section with absolute paths
     python3 -c "
-import json, sys
+import json
 
 with open('$SETTINGS') as f:
     existing = json.load(f)
 
-with open('$SCRIPT_DIR/settings-snippet.json') as f:
-    snippet = json.load(f)
+hooks_config = {
+    'Stop': [
+        {
+            'matcher': '',
+            'hooks': [
+                {
+                    'type': 'command',
+                    'command': 'bash $HOOK_DIR/drift-metric.sh',
+                    'timeout': 10
+                }
+            ]
+        }
+    ],
+    'PreToolUse': [
+        {
+            'matcher': 'Bash(git commit*)',
+            'hooks': [
+                {
+                    'type': 'command',
+                    'command': 'bash $HOOK_DIR/git-commit-gate.sh',
+                    'timeout': 5
+                }
+            ]
+        },
+        {
+            'matcher': 'Bash(git push*)',
+            'hooks': [
+                {
+                    'type': 'command',
+                    'command': 'bash $HOOK_DIR/git-push-gate.sh',
+                    'timeout': 5
+                }
+            ]
+        }
+    ]
+}
 
-# Merge hooks
 if 'hooks' not in existing:
     existing['hooks'] = {}
 
-for event, handlers in snippet['hooks'].items():
+for event, handlers in hooks_config.items():
     if event not in existing['hooks']:
         existing['hooks'][event] = handlers
     else:
-        # Append handlers that don't already exist
-        existing_cmds = {h['hooks'][0]['command'] for handler in existing['hooks'][event] for h in [handler]}
+        existing_cmds = set()
+        for handler in existing['hooks'][event]:
+            for h in handler.get('hooks', []):
+                existing_cmds.add(h.get('command', ''))
         for handler in handlers:
             cmd = handler['hooks'][0]['command']
-            if cmd not in existing_cmds:
+            # Also match if a relative-path version already exists
+            basename = cmd.split('/')[-1]
+            already = any(basename in c for c in existing_cmds)
+            if not already:
                 existing['hooks'][event].append(handler)
+            else:
+                # Replace existing relative-path version with absolute
+                for i, eh in enumerate(existing['hooks'][event]):
+                    for h in eh.get('hooks', []):
+                        if basename in h.get('command', '') and h['command'] != cmd:
+                            h['command'] = cmd
 
 with open('$SETTINGS', 'w') as f:
     json.dump(existing, f, indent=2)
 
-print('Merged hooks into $SETTINGS')
-" || echo "WARNING: Could not merge settings. Copy settings-snippet.json manually."
+print('Merged hooks into $SETTINGS (absolute paths)')
+" || echo "WARNING: Could not merge settings automatically."
 else
-    # No settings — create from snippet + empty permissions
+    # No settings — create fresh with absolute paths
     python3 -c "
 import json
-with open('$SCRIPT_DIR/settings-snippet.json') as f:
-    snippet = json.load(f)
-snippet['permissions'] = {'allow': []}
+
+settings = {
+    'permissions': {'allow': []},
+    'hooks': {
+        'Stop': [
+            {
+                'matcher': '',
+                'hooks': [
+                    {
+                        'type': 'command',
+                        'command': 'bash $HOOK_DIR/drift-metric.sh',
+                        'timeout': 10
+                    }
+                ]
+            }
+        ],
+        'PreToolUse': [
+            {
+                'matcher': 'Bash(git commit*)',
+                'hooks': [
+                    {
+                        'type': 'command',
+                        'command': 'bash $HOOK_DIR/git-commit-gate.sh',
+                        'timeout': 5
+                    }
+                ]
+            },
+            {
+                'matcher': 'Bash(git push*)',
+                'hooks': [
+                    {
+                        'type': 'command',
+                        'command': 'bash $HOOK_DIR/git-push-gate.sh',
+                        'timeout': 5
+                    }
+                ]
+            }
+        ]
+    }
+}
+
 with open('$SETTINGS', 'w') as f:
-    json.dump(snippet, f, indent=2)
-print('Created $SETTINGS')
+    json.dump(settings, f, indent=2)
+print('Created $SETTINGS (absolute paths)')
 "
 fi
 
 echo ""
 echo "Done. Drift hooks installed."
+echo ""
+echo "  Hook scripts:  $HOOK_DIR/"
+echo "  Settings:      $SETTINGS"
 echo ""
 echo "  /drift        — full analysis panel (on demand)"
 echo "  Stop hook     — drift score after every response (automatic)"
@@ -93,4 +185,4 @@ echo "Configure thresholds:"
 echo "  export DRIFT_COMMIT_THRESHOLD=0.20  # stricter commit gate"
 echo "  export DRIFT_PUSH_THRESHOLD=0.10    # stricter push gate"
 echo ""
-echo "Run tests: python3 .claude/hooks/test_drift_system.py"
+echo "Run tests: python3 $HOOK_DIR/test_drift_system.py"

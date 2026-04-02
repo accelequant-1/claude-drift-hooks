@@ -1,4 +1,5 @@
 {
+  "_comment": "TEMPLATE — install.sh replaces these with absolute paths. Do NOT copy this file directly into settings.local.json. Run install.sh instead.",
   "hooks": {
     "Stop": [
       {
@@ -6,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/drift-metric.sh",
+            "command": "bash __HOOK_DIR__/drift-metric.sh",
             "timeout": 10
           }
         ]
@@ -18,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/git-commit-gate.sh",
+            "command": "bash __HOOK_DIR__/git-commit-gate.sh",
             "timeout": 5
           }
         ]
@@ -28,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/git-push-gate.sh",
+            "command": "bash __HOOK_DIR__/git-push-gate.sh",
             "timeout": 5
           }
         ]
