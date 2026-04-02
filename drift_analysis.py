@@ -229,6 +229,30 @@ def main():
             except Exception:
                 print("║  STRATEGIC NEXT STEPS                                       ║")
                 print("║  (section error: next steps)                                ║")
+            print("╠══════════════════════════════════════════════════════════════╣")
+
+            # ── 7. Alignment score ──
+            try:
+                claude_score = int(100 * evidenced / max(total, 1))
+
+                turns_data = conn.execute(
+                    "SELECT drift_score FROM turns ORDER BY turn"
+                ).fetchall()
+                drifts = [r[0] for r in turns_data]
+                if len(drifts) >= 2:
+                    decreases = sum(1 for i in range(1, len(drifts)) if drifts[i] < drifts[i - 1])
+                    prompter_score = int(100 * decreases / max(len(drifts) - 1, 1))
+                else:
+                    prompter_score = 50
+
+                c_bar = bar(claude_score / 100, 10)
+                p_bar = bar(prompter_score / 100, 10)
+                print("║  ALIGNMENT                                                  ║")
+                print(f"║  Claude:   {claude_score:3d}/100  {c_bar}  (evidence ratio)       ║")
+                print(f"║  Prompter: {prompter_score:3d}/100  {p_bar}  (correction ratio)     ║")
+            except Exception:
+                print("║  ALIGNMENT                                                  ║")
+                print("║  (section error: alignment)                                 ║")
             print("╚══════════════════════════════════════════════════════════════╝")
 
     except Exception as exc:

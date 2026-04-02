@@ -168,6 +168,49 @@ def analyze_response(response_text: str) -> list[dict]:
     return claims
 
 
+def _compute_alignment(conn, stats) -> str:
+    """Compute dual alignment score: Claude and Prompter.
+
+    Claude score = evidence ratio (% claims with citations).
+    Prompter score = correction ratio (% of drift drops that followed a turn,
+        indicating the user pushed back and Claude improved).
+
+    Both are 0-100. Displayed as: "alignment: Claude 45 | Prompter 70"
+    """
+    try:
+        total = stats["total"]
+        evidenced = stats["evidenced"]
+        if total == 0:
+            return ""
+
+        # Claude score: straightforward evidence ratio
+        claude_score = int(100 * evidenced / total)
+
+        # Prompter score: how often did drift decrease between turns?
+        # A drift decrease means the user likely pushed back or Claude self-corrected.
+        # We attribute decreases to the prompter (they asked for evidence)
+        # and increases to Claude (it drifted without being caught).
+        turns = conn.execute(
+            "SELECT drift_score FROM turns ORDER BY turn"
+        ).fetchall()
+        drifts = [r[0] for r in turns]
+
+        if len(drifts) < 2:
+            prompter_score = 50  # no data, assume neutral
+        else:
+            decreases = sum(1 for i in range(1, len(drifts)) if drifts[i] < drifts[i - 1])
+            total_changes = max(len(drifts) - 1, 1)
+            # Prompter score: % of turn transitions where drift improved
+            # High = user is actively course-correcting
+            # Low = user is accepting drift without pushback
+            prompter_score = int(100 * decreases / total_changes)
+
+        return f"alignment: Claude {claude_score} | Prompter {prompter_score}"
+
+    except Exception:
+        return ""
+
+
 def _dynamic_funnel(conn, stats, drift, pa, pb, pc, unchecked) -> list[str]:
     """Context-dependent accountability intervention.
 
@@ -401,6 +444,17 @@ def main():
             if funnel_msg:
                 lines.append("")
                 lines.extend(funnel_msg)
+
+            # ── ALIGNMENT SCORE ──
+            # Dual accountability: Claude score + Prompter score.
+            # Claude: % of claims with evidence (higher = better)
+            # Prompter: % of turns where user pushed back / asked for clarification
+            #   (approximated by: turns where drift DECREASED after user intervention)
+            # Both scores persist across context compaction.
+            alignment = _compute_alignment(conn, stats)
+            if alignment:
+                lines.append("")
+                lines.append(alignment)
 
         msg = "\n".join(lines)
 

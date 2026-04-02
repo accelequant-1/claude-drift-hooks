@@ -8,9 +8,9 @@ Tracks whether Claude's factual claims have inline evidence. Gates commits and p
 
 In a long session we found 87% of technical claims lacked a file:line citation or command output. Most were correct but unverifiable without manually checking. This hooks into the session to surface that.
 
-## What This Does
+## How it works
 
-Three layers of enforcement:
+Three hooks:
 
 | Layer | When | What |
 |-------|------|------|
@@ -47,7 +47,7 @@ After installation, everything is automatic:
 - **`git commit`**: gated. High drift = warning with CHECK items
 - **`git push`**: gated. High drift = blocked with revert suggestions
 
-## The Three Drift Patterns
+## Drift patterns
 
 | Pattern | What Claude does | How the hook catches it |
 |---------|-----------------|----------------------|
@@ -55,35 +55,30 @@ After installation, everything is automatic:
 | **B: Narrative fabrication** | Rounds numbers, simplifies counts, constructs clean stories | Detects approximate language ("roughly", "about", "~") near numbers |
 | **C: Assumption propagation** | Repeats prior-context claims without re-verifying | Detects "as mentioned", "earlier", "we established", "previously" |
 
-## Configure Thresholds
+## Thresholds
+
+Configurable via env vars:
 
 ```bash
-# Stricter (recommended for production docs)
-export DRIFT_COMMIT_THRESHOLD=0.20
-export DRIFT_PUSH_THRESHOLD=0.10
-
-# Looser (for exploratory sessions)
-export DRIFT_COMMIT_THRESHOLD=0.40
-export DRIFT_PUSH_THRESHOLD=0.25
+export DRIFT_COMMIT_THRESHOLD=0.20  # default 0.30
+export DRIFT_PUSH_THRESHOLD=0.10    # default 0.15
 ```
 
-Hard floors prevent disabling:
-- Commit threshold cannot exceed 0.50
-- Push threshold cannot exceed 0.30
+Hard floors: commit max 0.50, push max 0.30.
 
-## Two-Tier Claim Detection
+## Claim detection
 
-**Tier 1 (regex, <1ms):** Catches numbers with units, percentages, file references, speedup claims.
+Two tiers, both under 1ms:
 
-**Tier 2 (heuristic, <1ms):** Catches comparative language ("outperforms"), temporal claims ("took 3 hours"), assertive framing ("The model produces"), PID/process references.
+- **Tier 1 (regex):** Numbers with units, percentages, file references, speedup claims.
+- **Tier 2 (heuristic):** Comparative language, temporal claims, assertive framing, PID/process references.
 
 ## Privacy
 
-- Claim texts are **hashed** (SHA-256) before storage. The DB stores `hash(text)`, not the raw text.
-- Only a redacted display summary is kept (first 5 words + last word).
-- The SQLite DB is local-only, `0600` permissions, git-ignored.
-- No network calls. No telemetry. No data leaves your machine.
-- Auto-truncates after 7 days.
+- Claim texts hashed (SHA-256) before storage. DB stores `hash(text)`, not raw text.
+- Redacted display only (first 5 words + last word).
+- SQLite local-only, `0600` permissions, git-ignored.
+- No network calls. Auto-truncates after 7 days.
 
 ## Files
 
@@ -103,4 +98,4 @@ Hard floors prevent disabling:
 
 ## Origin
 
-Built during a forensic code review session where instruction drift led to wrong documentation, wrong file sets, and multiple correction cycles across two GCP instances.
+Internal tool from a session where uncited claims led to wrong docs and multiple correction cycles.
