@@ -324,10 +324,11 @@ def get_session_drift(conn) -> dict:
             "SUM(CASE WHEN pattern='A' THEN 1 ELSE 0 END) as pa, "
             "SUM(CASE WHEN pattern='B' THEN 1 ELSE 0 END) as pb, "
             "SUM(CASE WHEN pattern='C' THEN 1 ELSE 0 END) as pc, "
-            "SUM(CASE WHEN pattern='D' THEN 1 ELSE 0 END) as pd, "
-            "MAX(turn) as last_turn "
+            "SUM(CASE WHEN pattern='D' THEN 1 ELSE 0 END) as pd "
             "FROM claims"
         ).fetchone()
+        # last_turn from turns table (not claims) so claim-free turns are counted
+        turn_row = conn.execute("SELECT MAX(turn) as last_turn FROM turns").fetchone()
         total = row["total"] or 0
         evidenced = row["evidenced"] or 0
         return {
@@ -339,7 +340,7 @@ def get_session_drift(conn) -> dict:
             "pattern_b": row["pb"] or 0,
             "pattern_c": row["pc"] or 0,
             "pattern_d": row["pd"] or 0,
-            "last_turn": row["last_turn"] or 0,
+            "last_turn": (turn_row["last_turn"] or 0) if turn_row else 0,
         }
     except Exception as exc:
         _log.error("drift_db: get_session_drift failed: %s", exc)

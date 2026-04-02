@@ -35,6 +35,9 @@ def _tier1_has_claim(line_s: str) -> bool:
         return True
     if re.search(r'\d+[KMGkmg]?\s*(files?|rows?|epochs?|hours?|GB|MB|KB|samples|lines?|params?|qubits?|games?|wins?|days?|seconds?)', line_s):
         return True
+    # Also catch "epoch 20", "step 500", "layer 3" (unit before number)
+    if re.search(r'(epoch|step|layer|block|turn|batch|iteration|version|phase|round|level)\s+\d+', line_s, re.I):
+        return True
     if re.search(r'\d{1,3}(,\d{3})+', line_s):
         return True
     if re.search(r'`[a-zA-Z_]+\.(py|sh|cfg|cpp|txt|npz|ckpt|gz)`', line_s):
@@ -465,8 +468,11 @@ def main():
         except (json.JSONDecodeError, OSError):
             hook_input = {}
 
-        # Extract response text
-        response_text = hook_input.get("response", "")
+        # Extract response text — Stop hook provides "last_assistant_message"
+        response_text = (
+            hook_input.get("last_assistant_message", "")
+            or hook_input.get("response", "")
+        )
         if not response_text:
             transcript = hook_input.get("transcript", [])
             if transcript:

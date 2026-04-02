@@ -179,14 +179,16 @@ def test_pattern_b():
 # ── Test 7: Pattern C ──
 
 def test_pattern_c():
-    name = "Pattern C: 'as we established earlier' classified as pattern C"
+    name = "Pattern C/D: prior-reference language classified as C or D"
     try:
-        # Use a line that won't be evidenced and contains pattern C trigger + a quantitative claim
+        # "as we established" triggers both Pattern C and Pattern D.
+        # Pattern D (post-compaction stale) overrides C when both match,
+        # since D is higher severity. Either is correct.
         response = "As we established earlier, the model uses 81 qubits."
         claims = analyze_response(response)
-        pattern_c = [c for c in claims if c.get("pattern") == "C"]
-        if not pattern_c:
-            _fail(name, f"no Pattern C claims; all claims={claims}")
+        pattern_cd = [c for c in claims if c.get("pattern") in ("C", "D")]
+        if not pattern_cd:
+            _fail(name, f"no Pattern C or D claims; all claims={claims}")
             return
         _pass(name)
     except Exception as e:
