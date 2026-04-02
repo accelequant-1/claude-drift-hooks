@@ -62,8 +62,15 @@ CREATE TABLE IF NOT EXISTS commits (
     unverified_claims INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS compaction_events (
+    id INTEGER PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    trigger TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_claims_commit ON claims(commit_sha);
 CREATE INDEX IF NOT EXISTS idx_claims_turn ON claims(turn);
+CREATE INDEX IF NOT EXISTS idx_claims_timestamp ON claims(timestamp);
 CREATE INDEX IF NOT EXISTS idx_claims_unverified ON claims(has_evidence, commit_sha);
 """
 
@@ -346,6 +353,37 @@ def get_session_drift(conn) -> dict:
         _log.error("drift_db: get_session_drift failed: %s", exc)
         return {"total": 0, "evidenced": 0, "unverified": 0, "drift": 0.0,
                 "pattern_a": 0, "pattern_b": 0, "pattern_c": 0, "pattern_d": 0, "last_turn": 0}
+
+
+def record_compaction(conn, trigger: str = "unknown"):
+    """Record a context compaction event."""
+    try:
+        ts = datetime.utcnow().isoformat()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO compaction_events (timestamp, trigger) VALUES (?, ?)",
+            (ts, trigger),
+        )
+        conn.execute("COMMIT")
+    except Exception as exc:
+        _log.error("drift_db: record_compaction failed: %s", exc)
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+
+
+def get_recent_compaction(conn, minutes: int = 5) -> bool:
+    """Check if a compaction event happened in the last N minutes."""
+    try:
+        cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).isoformat()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM compaction_events WHERE timestamp > ?",
+            (cutoff,),
+        ).fetchone()
+        return (row[0] or 0) > 0
+    except Exception:
+        return False
 
 
 def get_unverified_commits(conn) -> list[dict]:

@@ -18,7 +18,7 @@ mkdir -p "$COMMANDS"
 
 # Copy hook files
 for f in drift_db.py drift-metric.py drift-metric.sh drift_analysis.py \
-         git-commit-gate.sh git-push-gate.sh config.py; do
+         git-commit-gate.sh git-push-gate.sh post-compact-hook.sh config.py; do
     cp "$SCRIPT_DIR/$f" "$TARGET/$f"
 done
 
@@ -82,6 +82,18 @@ hooks_config = {
                 {
                     'type': 'command',
                     'command': 'bash $HOOK_DIR/git-push-gate.sh',
+                    'timeout': 5
+                }
+            ]
+        }
+    ],
+    'PostCompact': [
+        {
+            'matcher': '',
+            'hooks': [
+                {
+                    'type': 'command',
+                    'command': 'bash $HOOK_DIR/post-compact-hook.sh',
                     'timeout': 5
                 }
             ]
@@ -156,6 +168,18 @@ settings = {
                     {
                         'type': 'command',
                         'command': 'bash $HOOK_DIR/git-push-gate.sh',
+                        'timeout': 5
+                    }
+                ]
+            }
+        ],
+        'PostCompact': [
+            {
+                'matcher': '',
+                'hooks': [
+                    {
+                        'type': 'command',
+                        'command': 'bash $HOOK_DIR/post-compact-hook.sh',
                         'timeout': 5
                     }
                 ]

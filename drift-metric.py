@@ -284,50 +284,86 @@ def analyze_response(response_text: str) -> list[dict]:
     return claims
 
 
-def _compute_alignment(conn, stats) -> str:
-    """Compute dual alignment score: Claude and Prompter.
+def _suggest_prompt(claim_display: str, pattern: str | None) -> str:
+    """Generate a ready-to-paste prompt for verifying an unchecked claim."""
+    if pattern == "D":
+        return "re-read the file and re-run the command — don't trust prior context"
+    if pattern == "A":
+        return "read the actual source code, not the docstring or comment"
+    if pattern == "B":
+        return "run the command to get the exact number, not a rounded estimate"
+    if pattern == "C":
+        return "re-verify from current file state, don't repeat prior claims"
+    # Generic fallbacks based on content
+    if re.search(r'`[^`]+\.[a-zA-Z]+`', claim_display):
+        # Has a file reference
+        m = re.search(r'`([^`]+\.[a-zA-Z]+)`', claim_display)
+        if m:
+            return f"read {m.group(1)} and cite the exact line"
+    if re.search(r'\d+', claim_display):
+        return "run the command to get the exact number and cite the output"
+    return "cite file:line or command output to back this claim"
+
+
+def _compute_alignment(conn, stats) -> list[str]:
+    """Compute dual alignment score with actionable guidance.
 
     Claude score = evidence ratio (% claims with citations).
-    Prompter score = correction ratio (% of drift drops that followed a turn,
-        indicating the user pushed back and Claude improved).
+    Prompter score = correction ratio (% of drift drops that followed a turn).
 
-    Both are 0-100. Displayed as: "alignment: Claude 45 | Prompter 70"
+    Returns list of lines: score line + guidance for each party.
     """
     try:
         total = stats["total"]
         evidenced = stats["evidenced"]
         if total == 0:
-            return ""
+            return []
 
-        # Claude score: straightforward evidence ratio
         claude_score = int(100 * evidenced / total)
+        uncited = total - evidenced
 
-        # Prompter score: how often did drift decrease between turns?
-        # A drift decrease means the user likely pushed back or Claude self-corrected.
-        # We attribute decreases to the prompter (they asked for evidence)
-        # and increases to Claude (it drifted without being caught).
         turns = conn.execute(
             "SELECT drift_score FROM turns ORDER BY turn"
         ).fetchall()
         drifts = [r[0] for r in turns]
 
         if len(drifts) < 2:
-            prompter_score = 50  # no data, assume neutral
+            prompter_score = 50
+            missed_corrections = 0
         else:
             decreases = sum(1 for i in range(1, len(drifts)) if drifts[i] < drifts[i - 1])
+            increases = sum(1 for i in range(1, len(drifts)) if drifts[i] > drifts[i - 1])
             total_changes = max(len(drifts) - 1, 1)
-            # Prompter score: % of turn transitions where drift improved
-            # High = user is actively course-correcting
-            # Low = user is accepting drift without pushback
             prompter_score = int(100 * decreases / total_changes)
+            missed_corrections = increases
 
-        return f"alignment: Claude {claude_score} | Prompter {prompter_score}"
+        result = [f"alignment: Claude {claude_score} | Prompter {prompter_score}"]
+
+        # Claude guidance
+        if claude_score >= 100:
+            result.append("  Claude: perfect — every claim has evidence")
+        elif uncited <= 3:
+            result.append(f"  Claude: cite {uncited} more claim{'s' if uncited != 1 else ''} to reach 100")
+        else:
+            result.append(f"  Claude: {uncited} uncited claims — use file:line refs and command output")
+
+        # Prompter guidance
+        if prompter_score >= 100:
+            result.append("  Prompter: perfect — every drift spike was corrected")
+        elif missed_corrections == 0 and len(drifts) < 3:
+            result.append("  Prompter: too early to score — keep checking CHECKs when drift rises")
+        elif missed_corrections > 0:
+            result.append(f"  Prompter: {missed_corrections} uncorrected drift spike{'s' if missed_corrections != 1 else ''} — paste CHECK items back to close them")
+        else:
+            result.append("  Prompter: push back when drift rises — ask Claude to verify claims")
+
+        return result
 
     except Exception:
-        return ""
+        return []
 
 
-def _dynamic_funnel(conn, stats, drift, pa, pb, pc, pd, unchecked) -> list[str]:
+def _dynamic_funnel(conn, stats, drift, pa, pb, pc, pd, unchecked, recently_compacted=False) -> list[str]:
     """Context-dependent accountability intervention.
 
     Analyzes:
@@ -371,7 +407,8 @@ def _dynamic_funnel(conn, stats, drift, pa, pb, pc, pd, unchecked) -> list[str]:
         # A (docstring trust) is second — leads to factual errors
         # B (fabrication) is third — leads to misleading docs
         # C (propagation) is fourth — leads to stale claims
-        weighted_severity = (pd * 4 + pa * 3 + pb * 2 + pc * 1) / max(total, 1)
+        pd_weight = 6 if recently_compacted else 4
+        weighted_severity = (pd * pd_weight + pa * 3 + pb * 2 + pc * 1) / max(total, 1)
 
         # ── 4. Recency: fraction of unverified claims from last 3 turns ──
         recent_unverified = conn.execute(
@@ -542,6 +579,9 @@ def main():
             # Get top 3 unchecked claims for display
             unchecked = drift_db.get_uncommitted_unverified(conn)[:3]
 
+            # Check for recent compaction — spike Pattern D awareness
+            recently_compacted = drift_db.get_recent_compaction(conn)
+
             # NOTE: conn stays open inside the with-block — _dynamic_funnel needs it
             # Format output
             total = stats["total"]
@@ -559,16 +599,23 @@ def main():
                 f"drift: {drift:.0%} ({stats['evidenced']}/{total} evidenced){pattern_str} | turn {stats['last_turn']}"
             ]
 
+            if recently_compacted:
+                lines.append("  !! CONTEXT COMPACTED — re-verify all prior claims. Pattern D weight raised.")
+
             for item in unchecked:
                 cmd = item.get("verification_cmd", "")
-                cmd_str = f" -> {cmd}" if cmd else ""
-                lines.append(f"  CHECK: \"{item['claim_display']}\"{cmd_str}")
+                if cmd:
+                    prompt = f"verify: {cmd}"
+                else:
+                    prompt = _suggest_prompt(item.get("claim_display", ""), item.get("pattern"))
+                lines.append(f"  CHECK: \"{item['claim_display']}\"")
+                lines.append(f"    → {prompt}")
 
             # ── DYNAMIC FUNNEL ──
             # Context-dependent intervention based on drift severity, velocity,
             # pattern composition, and recency. Hardcoded thresholds are fallback.
 
-            funnel_msg = _dynamic_funnel(conn, stats, drift, pa, pb, pc, pd, unchecked)
+            funnel_msg = _dynamic_funnel(conn, stats, drift, pa, pb, pc, pd, unchecked, recently_compacted)
             if funnel_msg:
                 lines.append("")
                 lines.extend(funnel_msg)
@@ -579,10 +626,10 @@ def main():
             # Prompter: % of turns where user pushed back / asked for clarification
             #   (approximated by: turns where drift DECREASED after user intervention)
             # Both scores persist across context compaction.
-            alignment = _compute_alignment(conn, stats)
-            if alignment:
+            alignment_lines = _compute_alignment(conn, stats)
+            if alignment_lines:
                 lines.append("")
-                lines.append(alignment)
+                lines.extend(alignment_lines)
 
         msg = "\n".join(lines)
 

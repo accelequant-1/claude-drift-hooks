@@ -245,11 +245,29 @@ def main():
                 else:
                     prompter_score = 50
 
+                uncited = total - evidenced
+                increases = sum(1 for i in range(1, len(drifts)) if drifts[i] > drifts[i - 1]) if len(drifts) >= 2 else 0
+
                 c_bar = bar(claude_score / 100, 10)
                 p_bar = bar(prompter_score / 100, 10)
                 print("║  ALIGNMENT                                                  ║")
                 print(f"║  Claude:   {claude_score:3d}/100  {c_bar}  (evidence ratio)       ║")
                 print(f"║  Prompter: {prompter_score:3d}/100  {p_bar}  (correction ratio)     ║")
+                print("║                                                              ║")
+                # Claude guidance
+                if claude_score >= 100:
+                    print("║  Claude:   perfect — every claim has evidence                ║")
+                elif uncited <= 3:
+                    print(f"║  Claude:   cite {uncited} more claim{'s' if uncited != 1 else ' '} to reach 100                    ║")
+                else:
+                    print(f"║  Claude:   {uncited} uncited — use file:line and cmd output       ║")
+                # Prompter guidance
+                if prompter_score >= 100:
+                    print("║  Prompter: perfect — every drift spike was corrected         ║")
+                elif increases > 0:
+                    print(f"║  Prompter: {increases} uncorrected spike{'s' if increases != 1 else ' '} — paste CHECKs back      ║")
+                else:
+                    print("║  Prompter: push back when drift rises — ask to verify        ║")
             except Exception:
                 print("║  ALIGNMENT                                                  ║")
                 print("║  (section error: alignment)                                 ║")
