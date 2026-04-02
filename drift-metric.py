@@ -124,7 +124,7 @@ def _tier2_has_evidence(line_s: str, prev_line: str) -> bool:
 def _tier2_pattern(line_s: str) -> str | None:
     """Tier 2 pattern classification for unverified claims."""
     # Pattern A: docstring/comment/README trust
-    if re.search(r'docstring|comment|README|the code says|header says|described as|notes that|the docs say', line_s, re.I):
+    if re.search(r'docstring|comment|README|the code says|header says|described as|notes that|the docs say|documentation|according to', line_s, re.I):
         return "A"
     # Pattern B: approximate language with numbers
     if re.search(r'\b(approximately|roughly|about|around|nearly|almost)\b|~\s*\d+', line_s, re.I):
@@ -158,6 +158,25 @@ def _has_post_compaction_signal(line_s: str) -> bool:
     ))
 
 
+def _has_structural_evidence(line_s: str) -> bool:
+    """Evidence that survives post-compaction: file:line refs, command output.
+
+    Words like "verified" and "confirmed" are NOT structural evidence —
+    they are claims about past verification. Only concrete references to
+    files, line numbers, and command output count.
+    """
+    # file:line reference
+    if re.search(r'`?\w+\.\w+:\d+`?', line_s):
+        return True
+    # Command output reference
+    if re.search(r'grep|wc -l|ls -l|cat |head |git show|git log', line_s, re.I):
+        return True
+    # Explicit "from <file> output"
+    if re.search(r'from.*\.jsonl|from.*\.log|from.*output', line_s, re.I):
+        return True
+    return False
+
+
 def _tier3_has_claim(line_s: str) -> bool:
     """Tier 3 claim detection: catch-all for substantive statements.
 
@@ -177,7 +196,7 @@ def _tier3_has_claim(line_s: str) -> bool:
         return False
     # Any remaining sentence with a verb-like structure is a claim
     # (subject + verb patterns, or imperative statements)
-    if re.search(r'\b(is|are|was|were|has|have|had|does|do|did|will|would|can|could|should|must|means|uses|runs|takes|produces|generates|creates|returns|shows|contains|includes|supports|requires|needs|works|handles|processes|stores|loads|reads|writes|calls|sends|receives|accepts|provides|allows|enables|prevents|ensures|maintains|preserves|tracks|measures|detects|computes|calculates|implements|defines|represents|maps|converts|transforms|encodes|decodes)\b', line_s, re.I):
+    if re.search(r'\b(is|are|was|were|has|have|had|does|do|did|will|would|can|could|should|must|means|uses|runs|takes|produces|generates|creates|returns|shows|contains|includes|supports|requires|needs|works|handles|processes|stores|loads|reads|writes|calls|sends|receives|accepts|provides|allows|enables|prevents|ensures|maintains|preserves|tracks|measures|detects|computes|calculates|implements|defines|represents|maps|converts|transforms|encodes|decodes|matches|inherits|exists|passes|fails|operates|verifies|confirms|validates|expects|achieves|reaches|exceeds)\b', line_s, re.I):
         return True
     # Declarative statements starting with common patterns
     if re.match(r'(The|This|That|It|They|We|Our|Your|Each|Every|All|No|Any|Most|Some)\b', line_s):
@@ -202,12 +221,21 @@ def analyze_response(response_text: str) -> list[dict]:
 
         prev_line = lines[idx - 1] if idx > 0 else ""
 
+        # ── Post-compaction check (shared across tiers) ──
+        # "We confirmed X" is a CLAIM about past verification, not fresh evidence.
+        # When a post-compaction signal is present, words like "verified" and
+        # "confirmed" don't count as evidence — only structural evidence does
+        # (file:line refs, command output, tool results).
+        is_post_compaction = _has_post_compaction_signal(line_s)
+
         # ── Tier 1 ──
         if _tier1_has_claim(line_s):
             has_evidence = _tier1_has_evidence(line_s)
+            if is_post_compaction and has_evidence:
+                # Re-check: only structural evidence survives post-compaction
+                has_evidence = _has_structural_evidence(line_s)
             pattern = None if has_evidence else _tier1_pattern(line_s)
-            # Pattern D overrides: post-compaction stale references
-            if not has_evidence and _has_post_compaction_signal(line_s):
+            if not has_evidence and is_post_compaction:
                 pattern = "D"
             claims.append({
                 "text": line_s[:200],
@@ -220,8 +248,10 @@ def analyze_response(response_text: str) -> list[dict]:
         # ── Tier 2 (only for lines Tier 1 did NOT classify as claims) ──
         if _tier2_has_claim(line_s):
             has_evidence = _tier2_has_evidence(line_s, prev_line)
+            if is_post_compaction and has_evidence:
+                has_evidence = _has_structural_evidence(line_s)
             pattern = None if has_evidence else _tier2_pattern(line_s)
-            if not has_evidence and _has_post_compaction_signal(line_s):
+            if not has_evidence and is_post_compaction:
                 pattern = "D"
             claims.append({
                 "text": line_s[:200],
@@ -239,9 +269,10 @@ def analyze_response(response_text: str) -> list[dict]:
                 _tier1_has_evidence(line_s)
                 or _tier2_has_evidence(line_s, prev_line)
             )
+            if is_post_compaction and has_evidence:
+                has_evidence = _has_structural_evidence(line_s)
             pattern = None if has_evidence else _tier2_pattern(line_s)
-            # Pattern D override: post-compaction stale claims
-            if not has_evidence and _has_post_compaction_signal(line_s):
+            if not has_evidence and is_post_compaction:
                 pattern = "D"
             claims.append({
                 "text": line_s[:200],
