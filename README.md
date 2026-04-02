@@ -105,4 +105,4 @@ Hard floors prevent disabling:
 
 ## Origin
 
-Built during a forensic code review session where instruction drift cost ~$10K+ in cloud compute from unverified claims leading to wrong documentation, wrong file sets, and multiple correction cycles. The drift metric is the tool we wish we had from the start.
+Built during a forensic code review session where instruction drift led to wrong documentation, wrong file sets, and multiple correction cycles across two GCP instances. The drift metric is the tool we wish we had from the start.
