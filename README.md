@@ -1,14 +1,12 @@
-# Claude Drift Hooks
+# claude-drift-hooks
 
-Instruction drift measurement and enforcement for Claude Code sessions.
+Internal hooks for measuring instruction drift in Claude Code sessions.
 
-Measures the gap between what Claude claims and what Claude can prove. Gates git commits and pushes based on evidence quality.
+Tracks whether Claude's factual claims have inline evidence. Gates commits and pushes when too many claims are uncited.
 
-## The Problem
+## Why
 
-In a 700+ turn session, we measured **87.4% drift** — 229 out of 262 technical claims had no inline evidence (file:line citation, command output, or process verification). 8 of those were factually wrong. The rest were correct but unverifiable without checking yourself.
-
-The breakdown layer: Claude says "checked" without showing the evidence. You accept because you can't see the work.
+In a long session we found 87% of technical claims lacked a file:line citation or command output. Most were correct but unverifiable without manually checking. This hooks into the session to surface that.
 
 ## What This Does
 
@@ -105,4 +103,4 @@ Hard floors prevent disabling:
 
 ## Origin
 
-Built during a forensic code review session where instruction drift led to wrong documentation, wrong file sets, and multiple correction cycles across two GCP instances. The drift metric is the tool we wish we had from the start.
+Built during a forensic code review session where instruction drift led to wrong documentation, wrong file sets, and multiple correction cycles across two GCP instances.
