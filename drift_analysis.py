@@ -271,6 +271,39 @@ def main():
             except Exception:
                 print("║  ALIGNMENT                                                  ║")
                 print("║  (section error: alignment)                                 ║")
+            print("╠══════════════════════════════════════════════════════════════╣")
+
+            # ── 8. Verification ledger ──
+            try:
+                recent_v = drift_db.get_recent_verifications(conn, limit=10)
+                pending_v = drift_db.get_unverified_claims(conn, limit=5)
+                vstats = drift_db.get_verification_stats(conn)
+
+                print("║  VERIFICATION LEDGER                                        ║")
+                print(f"║  {vstats['verified']} verified, {vstats['pending']} pending, {vstats['auto_evidenced']} auto-evidenced     ║")
+
+                if recent_v:
+                    for v in recent_v[:5]:
+                        loc = ""
+                        if v.get("file_path") and v.get("line_number"):
+                            loc = f" @ {v['file_path']}:{v['line_number']}"
+                        label = f"✓ turn {v['turn']}: \"{v['claim_display'][:30]}\"{loc}"
+                        if len(label) > 56:
+                            label = label[:56]
+                        print(f"║  {label}")
+
+                if pending_v:
+                    for p in pending_v[:3]:
+                        label = f"✗ turn {p['turn']}: \"{p['claim_display'][:35]}\" — PENDING"
+                        if len(label) > 56:
+                            label = label[:56]
+                        print(f"║  {label}")
+
+                if not recent_v and not pending_v:
+                    print("║  (no verification events yet)                               ║")
+            except Exception:
+                print("║  VERIFICATION LEDGER                                        ║")
+                print("║  (section error: verification ledger)                       ║")
             print("╚══════════════════════════════════════════════════════════════╝")
 
     except Exception as exc:

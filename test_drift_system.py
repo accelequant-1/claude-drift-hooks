@@ -207,7 +207,7 @@ def test_drift_metric_output():
             "As we established earlier, this runs for 50 epochs. "
             "wc -l confirms 620 lines (verified from wc -l)."
         )
-        hook_input = json.dumps({"response": response_text})
+        hook_input = json.dumps({"last_assistant_message": response_text})
         result = subprocess.run(
             [sys.executable, str(DRIFT_METRIC_PY)],
             input=hook_input,
@@ -278,7 +278,7 @@ def test_missing_db_recovery():
     name = "Error recovery — missing DB: drift-metric.py outputs valid JSON"
     _remove_db()
     try:
-        hook_input = json.dumps({"response": "The model has 100 params."})
+        hook_input = json.dumps({"last_assistant_message": "The model has 100 params."})
         result = subprocess.run(
             [sys.executable, str(DRIFT_METRIC_PY)],
             input=hook_input,
@@ -296,8 +296,9 @@ def test_missing_db_recovery():
         except json.JSONDecodeError as e:
             _fail(name, f"invalid JSON: {e}; stdout={stdout[:200]}")
             return
-        if "systemMessage" not in data:
-            _fail(name, f"no 'systemMessage' key; keys={list(data.keys())}")
+        # Accept either systemMessage (continue) or decision (block) as valid
+        if "systemMessage" not in data and "decision" not in data:
+            _fail(name, f"no 'systemMessage' or 'decision' key; keys={list(data.keys())}")
             return
         _pass(name)
     except Exception as e:
@@ -314,7 +315,7 @@ def test_corrupt_db_recovery():
     try:
         # Write garbage to drift.db
         DB_PATH.write_bytes(b"THIS IS NOT A SQLITE DATABASE \x00\xff\x00\xab\xcd")
-        hook_input = json.dumps({"response": "There are 50 epochs in training."})
+        hook_input = json.dumps({"last_assistant_message": "There are 50 epochs in training."})
         result = subprocess.run(
             [sys.executable, str(DRIFT_METRIC_PY)],
             input=hook_input,
@@ -332,8 +333,8 @@ def test_corrupt_db_recovery():
         except json.JSONDecodeError as e:
             _fail(name, f"invalid JSON: {e}; stdout={stdout[:200]}")
             return
-        if "systemMessage" not in data:
-            _fail(name, f"no 'systemMessage' key; keys={list(data.keys())}")
+        if "systemMessage" not in data and "decision" not in data:
+            _fail(name, f"no 'systemMessage' or 'decision' key; keys={list(data.keys())}")
             return
         _pass(name)
     except Exception as e:
@@ -382,7 +383,7 @@ def test_dynamic_funnel_high_drift():
             insert_claims(conn, 3, claims_batch[:5])
             insert_turn(conn, 3, 5, 0, 1.0)
 
-        hook_input = json.dumps({"response": "There are 500 rows in the dataset and model uses 192 channels."})
+        hook_input = json.dumps({"last_assistant_message": "There are 500 rows in the dataset and model uses 192 channels."})
         result = subprocess.run(
             [sys.executable, str(DRIFT_METRIC_PY)],
             input=hook_input,

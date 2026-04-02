@@ -68,9 +68,24 @@ CREATE TABLE IF NOT EXISTS compaction_events (
     trigger TEXT
 );
 
+CREATE TABLE IF NOT EXISTS verifications (
+    id INTEGER PRIMARY KEY,
+    claim_id INTEGER NOT NULL,
+    timestamp TEXT NOT NULL,
+    citation_type TEXT NOT NULL,
+    file_path TEXT,
+    line_number INTEGER,
+    byte_offset INTEGER,
+    snippet TEXT,
+    verification_cmd TEXT,
+    cmd_output_hash TEXT,
+    FOREIGN KEY (claim_id) REFERENCES claims(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_claims_commit ON claims(commit_sha);
 CREATE INDEX IF NOT EXISTS idx_claims_turn ON claims(turn);
 CREATE INDEX IF NOT EXISTS idx_claims_timestamp ON claims(timestamp);
+CREATE INDEX IF NOT EXISTS idx_verifications_claim ON verifications(claim_id);
 CREATE INDEX IF NOT EXISTS idx_claims_unverified ON claims(has_evidence, commit_sha);
 """
 
@@ -384,6 +399,114 @@ def get_recent_compaction(conn, minutes: int = 5) -> bool:
         return (row[0] or 0) > 0
     except Exception:
         return False
+
+
+def record_verification(conn, claim_id: int, citation: dict):
+    """Record a verification for a claim and mark it as verified.
+
+    citation dict: {
+        "type": "file"|"command"|"grep"|"git_log",
+        "file_path": str|None, "line_number": int|None,
+        "byte_offset": int|None, "snippet": str|None,
+        "verification_cmd": str|None, "cmd_output_hash": str|None,
+    }
+    """
+    try:
+        ts = datetime.utcnow().isoformat()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO verifications (claim_id, timestamp, citation_type, "
+            "file_path, line_number, byte_offset, snippet, verification_cmd, cmd_output_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (claim_id, ts, citation.get("type", "unknown"),
+             citation.get("file_path"), citation.get("line_number"),
+             citation.get("byte_offset"), (citation.get("snippet") or "")[:120],
+             citation.get("verification_cmd"), citation.get("cmd_output_hash")),
+        )
+        conn.execute("UPDATE claims SET verified = 1 WHERE id = ?", (claim_id,))
+        conn.execute("COMMIT")
+
+        # Append to ledger file (human-readable audit trail)
+        _append_ledger(claim_id, ts, citation)
+    except Exception as exc:
+        _log.error("drift_db: record_verification failed: %s", exc)
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+
+
+def _append_ledger(claim_id: int, timestamp: str, citation: dict):
+    """Append a verification event to the JSONL ledger file."""
+    import json as _json
+    ledger_path = Path(__file__).parent / "verification_ledger.jsonl"
+    try:
+        entry = {
+            "timestamp": timestamp,
+            "claim_id": claim_id,
+            "citation": {
+                "type": citation.get("type"),
+                "file": citation.get("file_path"),
+                "line": citation.get("line_number"),
+                "byte": citation.get("byte_offset"),
+                "snippet": (citation.get("snippet") or "")[:80],
+            },
+            "status": "verified",
+        }
+        with open(ledger_path, "a") as f:
+            f.write(_json.dumps(entry) + "\n")
+    except Exception as exc:
+        _log.error("drift_db: ledger write failed: %s", exc)
+
+
+def get_unverified_claims(conn, limit: int = 10) -> list[dict]:
+    """Get claims that have no evidence AND are not yet verified."""
+    try:
+        rows = conn.execute(
+            "SELECT id, turn, claim_display, claim_hash, pattern, verification_cmd "
+            "FROM claims WHERE has_evidence = 0 AND verified = 0 "
+            "ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        _log.error("drift_db: get_unverified_claims failed: %s", exc)
+        return []
+
+
+def get_verification_stats(conn) -> dict:
+    """Get verification statistics for the session."""
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) as total, "
+            "SUM(CASE WHEN verified = 1 THEN 1 ELSE 0 END) as verified, "
+            "SUM(CASE WHEN has_evidence = 1 THEN 1 ELSE 0 END) as auto_evidenced, "
+            "SUM(CASE WHEN has_evidence = 0 AND verified = 0 THEN 1 ELSE 0 END) as pending "
+            "FROM claims"
+        ).fetchone()
+        return {
+            "total": row["total"] or 0,
+            "verified": row["verified"] or 0,
+            "auto_evidenced": row["auto_evidenced"] or 0,
+            "pending": row["pending"] or 0,
+        }
+    except Exception:
+        return {"total": 0, "verified": 0, "auto_evidenced": 0, "pending": 0}
+
+
+def get_recent_verifications(conn, limit: int = 10) -> list[dict]:
+    """Get recent verification events with citation details."""
+    try:
+        rows = conn.execute(
+            "SELECT v.timestamp, v.citation_type, v.file_path, v.line_number, "
+            "v.byte_offset, v.snippet, c.claim_display, c.turn "
+            "FROM verifications v JOIN claims c ON v.claim_id = c.id "
+            "ORDER BY v.id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
 
 
 def get_unverified_commits(conn) -> list[dict]:

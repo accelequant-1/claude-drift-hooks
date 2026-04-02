@@ -284,6 +284,110 @@ def analyze_response(response_text: str) -> list[dict]:
     return claims
 
 
+# ---------------------------------------------------------------------------
+# Citation extraction & auto-verification
+# ---------------------------------------------------------------------------
+
+def _extract_citations(response_text: str) -> list[dict]:
+    """Extract exact citations from a response for matching against pending claims.
+
+    Detects:
+    - file.py:42 references (file + line number)
+    - `wc -l`, `grep`, `ls -l` command invocations
+    - Explicit "verified via" / "confirmed at" patterns
+    """
+    citations = []
+
+    # file:line references (e.g., drift_db.py:33, config.py:15)
+    for m in re.finditer(r'`?(\w[\w/.-]*\.\w+):(\d+)`?', response_text):
+        citations.append({
+            "type": "file",
+            "file_path": m.group(1),
+            "line_number": int(m.group(2)),
+            "byte_offset": None,
+            "snippet": None,
+            "verification_cmd": None,
+            "cmd_output_hash": None,
+            "raw_match": m.group(0),
+        })
+
+    # Command output patterns (wc -l, grep, ls -lh, etc.)
+    for m in re.finditer(r'(?:wc -l|grep -[ncl]|ls -[lh]+|head -\d+|cat )\s*(\S+)', response_text):
+        citations.append({
+            "type": "command",
+            "file_path": m.group(1) if not m.group(1).startswith('-') else None,
+            "line_number": None,
+            "byte_offset": None,
+            "snippet": None,
+            "verification_cmd": m.group(0).strip(),
+            "cmd_output_hash": None,
+            "raw_match": m.group(0),
+        })
+
+    return citations
+
+
+def _match_and_verify(conn, citations: list[dict], unverified: list[dict]):
+    """Match extracted citations against unverified claims and record verifications.
+
+    Matching heuristics (in priority order):
+    1. File path overlap: claim display or DB text mentions file X
+    2. Keyword overlap: extract significant words from claim and citation
+    3. Numeric overlap: claim mentions number N, citation references same magnitude
+    4. Command match: claim's verification_cmd matches a run command
+    """
+    if not citations or not unverified:
+        return
+
+    for claim in unverified:
+        display = claim.get("claim_display", "")
+        claim_vcmd = claim.get("verification_cmd", "")
+
+        # Extract keywords from claim for fuzzy matching
+        claim_words = set(re.findall(r'[a-zA-Z_]\w+', display.lower()))
+        # Extract numbers from claim
+        claim_numbers = set(re.findall(r'\d+', display))
+
+        for cit in citations:
+            matched = False
+            cit_file = cit.get("file_path") or ""
+
+            # 1. Direct file path overlap in claim text
+            if cit_file and cit_file in display:
+                matched = True
+
+            # 2. File basename overlap
+            if not matched and cit_file:
+                basename = cit_file.rsplit("/", 1)[-1] if "/" in cit_file else cit_file
+                basename_stem = basename.rsplit(".", 1)[0] if "." in basename else basename
+                if basename and (basename in display or basename_stem.lower() in claim_words):
+                    matched = True
+
+            # 3. Keyword overlap: if claim mentions "config" and citation is config.py
+            if not matched and cit_file:
+                file_stem = cit_file.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+                if file_stem and file_stem in claim_words:
+                    matched = True
+
+            # 4. Numeric overlap with same file context
+            if not matched and cit_file and claim_numbers:
+                cit_line = str(cit.get("line_number") or "")
+                # If the claim has a number and the citation is about a plausibly related file
+                # This is a weaker match — only use if keyword context supports it
+                cit_words = set(re.findall(r'[a-zA-Z_]\w+', cit_file.lower()))
+                if claim_words & cit_words:
+                    matched = True
+
+            # 5. Verification command overlap
+            if not matched and claim_vcmd and cit.get("verification_cmd"):
+                if cit["verification_cmd"] in claim_vcmd or claim_vcmd in cit["verification_cmd"]:
+                    matched = True
+
+            if matched:
+                drift_db.record_verification(conn, claim["id"], cit)
+                break  # One verification per claim
+
+
 def _suggest_prompt(claim_display: str, pattern: str | None) -> str:
     """Generate a ready-to-paste prompt for verifying an unchecked claim."""
     if pattern == "D":
@@ -319,8 +423,13 @@ def _compute_alignment(conn, stats) -> list[str]:
         if total == 0:
             return []
 
-        claude_score = int(100 * evidenced / total)
-        uncited = total - evidenced
+        # Claude score: verified claims get full credit, auto-evidenced 80%, uncited 0%
+        vstats = drift_db.get_verification_stats(conn)
+        verified = vstats["verified"]
+        auto_ev = vstats["auto_evidenced"]
+        weighted = (verified * 1.0 + auto_ev * 0.8) / max(total, 1)
+        claude_score = min(int(100 * weighted), 100)
+        uncited = total - evidenced - verified
 
         turns = conn.execute(
             "SELECT drift_score FROM turns ORDER BY turn"
@@ -555,38 +664,52 @@ def main():
                             response_text = content
                         break
 
+        # Check if this is a re-entry (stop_hook_active) to prevent infinite loops
+        stop_hook_active = hook_input.get("stop_hook_active", False)
+
         # Use context manager — auto-closes even on errors
         with drift_db.DriftDB() as conn:
             # Get current turn count
             stats = drift_db.get_session_drift(conn)
             turn = stats["last_turn"] + 1
 
+            # ── AUTO-VERIFY: match citations in this response against pending claims ──
+            verified_this_turn = []
+            if response_text:
+                citations = _extract_citations(response_text)
+                if citations:
+                    pending = drift_db.get_unverified_claims(conn, limit=20)
+                    if pending:
+                        _match_and_verify(conn, citations, pending)
+                        # Check what was just verified
+                        verified_this_turn = drift_db.get_recent_verifications(conn, limit=5)
+
             # Analyze and store — EVERY turn is recorded, no cold start.
-            # Even turns with zero detected claims get a turn entry so the
-            # turn counter stays accurate and the session is always tracked.
             if response_text:
                 claims = analyze_response(response_text)
                 if claims:
                     drift_db.insert_claims(conn, turn, claims)
-                total = len(claims)
-                evidenced = sum(1 for c in claims if c["has_evidence"])
-                drift = (total - evidenced) / total if total > 0 else 0.0
-                drift_db.insert_turn(conn, turn, total, evidenced, drift)
+                total_turn = len(claims)
+                evidenced_turn = sum(1 for c in claims if c["has_evidence"])
+                drift_turn = (total_turn - evidenced_turn) / total_turn if total_turn > 0 else 0.0
+                drift_db.insert_turn(conn, turn, total_turn, evidenced_turn, drift_turn)
 
-            # Get session-level stats
+            # Get session-level stats (after verification updates)
             stats = drift_db.get_session_drift(conn)
+            vstats = drift_db.get_verification_stats(conn)
 
-            # Get top 3 unchecked claims for display
-            unchecked = drift_db.get_uncommitted_unverified(conn)[:3]
+            # Get pending claims for display
+            unchecked = drift_db.get_uncommitted_unverified(conn)[:5]
 
-            # Check for recent compaction — spike Pattern D awareness
+            # Check for recent compaction
             recently_compacted = drift_db.get_recent_compaction(conn)
 
-            # NOTE: conn stays open inside the with-block — _dynamic_funnel needs it
             # Format output
             total = stats["total"]
             drift = stats["drift"]
             pa, pb, pc, pd = stats["pattern_a"], stats["pattern_b"], stats["pattern_c"], stats.get("pattern_d", 0)
+            verified_count = vstats["verified"]
+            pending_count = vstats["pending"]
 
             pattern_parts = []
             if pa: pattern_parts.append(f"A:{pa}")
@@ -595,37 +718,44 @@ def main():
             if pd: pattern_parts.append(f"D:{pd}")
             pattern_str = f" | {' '.join(pattern_parts)}" if pattern_parts else ""
 
+            verified_str = f", {verified_count} verified" if verified_count else ""
             lines = [
-                f"drift: {drift:.0%} ({stats['evidenced']}/{total} evidenced){pattern_str} | turn {stats['last_turn']}"
+                f"drift: {drift:.0%} ({stats['evidenced']}/{total} evidenced{verified_str}){pattern_str} | turn {stats['last_turn']}"
             ]
 
             if recently_compacted:
                 lines.append("  !! CONTEXT COMPACTED — re-verify all prior claims. Pattern D weight raised.")
 
-            for item in unchecked:
-                cmd = item.get("verification_cmd", "")
-                if cmd:
-                    prompt = f"verify: {cmd}"
-                else:
-                    prompt = _suggest_prompt(item.get("claim_display", ""), item.get("pattern"))
-                lines.append(f"  CHECK: \"{item['claim_display']}\"")
-                lines.append(f"    → {prompt}")
+            # Show verified claims this turn
+            if verified_this_turn:
+                lines.append(f"  VERIFIED this turn ({len(verified_this_turn)}):")
+                for v in verified_this_turn[:3]:
+                    loc = ""
+                    if v.get("file_path") and v.get("line_number"):
+                        loc = f" @ {v['file_path']}:{v['line_number']}"
+                        if v.get("byte_offset"):
+                            loc += f" (byte {v['byte_offset']})"
+                    lines.append(f"    ✓ \"{v['claim_display'][:50]}\"{loc}")
+
+            # Show pending claims
+            if unchecked:
+                lines.append(f"  PENDING ({pending_count} unclosed):")
+                for item in unchecked:
+                    cmd = item.get("verification_cmd", "")
+                    if cmd:
+                        prompt = f"verify: {cmd}"
+                    else:
+                        prompt = _suggest_prompt(item.get("claim_display", ""), item.get("pattern"))
+                    lines.append(f"    \"{item['claim_display']}\"")
+                    lines.append(f"      → {prompt}")
 
             # ── DYNAMIC FUNNEL ──
-            # Context-dependent intervention based on drift severity, velocity,
-            # pattern composition, and recency. Hardcoded thresholds are fallback.
-
             funnel_msg = _dynamic_funnel(conn, stats, drift, pa, pb, pc, pd, unchecked, recently_compacted)
             if funnel_msg:
                 lines.append("")
                 lines.extend(funnel_msg)
 
             # ── ALIGNMENT SCORE ──
-            # Dual accountability: Claude score + Prompter score.
-            # Claude: % of claims with evidence (higher = better)
-            # Prompter: % of turns where user pushed back / asked for clarification
-            #   (approximated by: turns where drift DECREASED after user intervention)
-            # Both scores persist across context compaction.
             alignment_lines = _compute_alignment(conn, stats)
             if alignment_lines:
                 lines.append("")
@@ -633,10 +763,44 @@ def main():
 
         msg = "\n".join(lines)
 
-        output = {
-            "systemMessage": f"[DRIFT]\n{msg}",
-            "continue": True,
-        }
+        # ── DECISION: block or continue ──
+        # If drift is high AND there are actionable pending claims AND this isn't
+        # a re-entry (prevent infinite loops), force Claude to verify before stopping.
+        should_block = (
+            not stop_hook_active
+            and drift > 0.50
+            and pending_count > 0
+            and any(item.get("verification_cmd") for item in unchecked)
+        )
+
+        if should_block:
+            # Build verification instruction for Claude
+            verify_cmds = []
+            for item in unchecked[:3]:
+                cmd = item.get("verification_cmd", "")
+                if cmd:
+                    verify_cmds.append(f"  {cmd}  # for: {item['claim_display'][:40]}")
+            if verify_cmds:
+                block_reason = (
+                    f"[DRIFT] drift {drift:.0%} with {pending_count} unclosed claims. "
+                    f"Run these commands and cite the results:\n"
+                    + "\n".join(verify_cmds)
+                )
+                output = {
+                    "decision": "block",
+                    "reason": block_reason,
+                }
+            else:
+                output = {
+                    "systemMessage": f"[DRIFT]\n{msg}",
+                    "continue": True,
+                }
+        else:
+            output = {
+                "systemMessage": f"[DRIFT]\n{msg}",
+                "continue": True,
+            }
+
         print(json.dumps(output))
 
     except Exception as exc:

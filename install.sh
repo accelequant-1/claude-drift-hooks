@@ -36,6 +36,7 @@ if [ ! -f "$GITIGNORE" ] || ! grep -q "hooks/\*.db" "$GITIGNORE" 2>/dev/null; th
     echo "hooks/*.db" >> "$GITIGNORE"
     echo "hooks/drift_state.json" >> "$GITIGNORE"
     echo "hooks/drift_errors.log" >> "$GITIGNORE"
+    echo "hooks/verification_ledger.jsonl" >> "$GITIGNORE"
     echo "hooks/__pycache__/" >> "$GITIGNORE"
     echo "settings.local.json" >> "$GITIGNORE"
 fi
